@@ -15,7 +15,7 @@
 
 #define FILE_READ_CHUNK 1024
 #define SHM_SIZE 65536
-#define SOCKET_READ_CHUNK 1024 // SHM_SIZE should be divisable by this
+#define SOCKET_READ_CHUNK 1024 // SHM_SIZE should be divisible by this
 
 #define SHM_ENV_VAR "__AFL_SHM_ID"
 
@@ -32,9 +32,11 @@
 
 #define MAX_TRIES 40
 
-#define MAX_URI_LENGTH 100
 #define DEFAULT_SERVER "localhost"
 #define DEFAULT_PORT "7007"
+
+#define DEFAULT_MODE 0
+#define LOCAL_MODE 1
 
 uint8_t* trace_bits;
 int prev_location = 0;
@@ -43,7 +45,7 @@ int prev_location = 0;
 FILE* logfile;
 
 /* Running inside AFL or standalone */
-int in_afl = 0;
+uint8_t in_afl = 0;
 
 #define OUTPUT_STDOUT
 //#define OUTPUT_FILE
@@ -99,6 +101,10 @@ void setup_tcp_connection(const char* hostname, const char* port) {
   freeaddrinfo(res);
 }
 
+void printUsageAndDie() {
+  DIE("Usage: interface [-s <server>] [-p <port>] <filename>\n");
+}
+
 int main(int argc, char** argv) {
 
   /* Stdout is piped to null, so write output to a file */
@@ -109,66 +115,51 @@ int main(int argc, char** argv) {
   }
 #endif
 
-  /* Parse input */
-  if (argc != 2 && !(argc == 4 && argv[1][0] == '-' && argv[1][1] == 's')) {
-    DIE("Usage: interface [-s <server-list-file>] <filename>\n");
-  }
+  /* Parameters */
   const char* filename;
-  int num_servers;
-  char** servers;
-  char** ports;
-  if (argc == 4) {
-    filename = argv[3];
+  char* server = DEFAULT_SERVER;
+  char* port = DEFAULT_PORT;
 
-    // read servers file
-    FILE *sfile = fopen(argv[2], "r");
-    if (!sfile) {
-      DIE("File does not exist: %s\n", argv[2]);
-    }      
-    
-    //count lines first
-    int lines = 0;
-    char buf[MAX_URI_LENGTH];
-    while (fgets(buf, MAX_URI_LENGTH, sfile) != NULL)
-      lines++;
-    rewind(sfile);
+  /* Check num of parameters */
+  if (argc < 2)
+    printUsageAndDie();
 
-    //now load them
-    servers = (char**) malloc(lines * sizeof(char *));
-    ports = (char**) malloc(lines * sizeof(char *));
-    for (int line = 0; line < lines; line++) {
-      servers[line] = malloc(MAX_URI_LENGTH+6 * sizeof(char)); // +6 for port
-      fgets(servers[line], MAX_URI_LENGTH, sfile);
-      servers[line][strlen(servers[line])-1] = '\0'; // strip newline char
-
-      // if has port, store it
-      char* colon_pos = strchr(servers[line], ':');
-      if (colon_pos) {
-	ports[line] = colon_pos+1;
-	*colon_pos = '\0';
+  /* Parse parameters */
+  int curArg = 1;
+  while (curArg < argc) {
+    if (argv[curArg][0] == '-') { //flag
+      if (argv[curArg][1] == 's') {
+        // set server
+	server = argv[curArg+1];
+	curArg += 2;
+      } else if (argv[curArg][1] == 'p') {
+        // set port
+	port = argv[curArg+1];
+	curArg += 2;
       } else {
-	ports[line] = DEFAULT_PORT;
+        LOG("Unknown flag: %s\n", argv[curArg]);
+	printUsageAndDie();
       }
+    } else {
+      break; // expect filename now
     }
-    num_servers = lines;
-
-    fclose(sfile);
-  } else {
-    filename = argv[1];
-    num_servers = 1;
-    servers = (char**) malloc(sizeof(char *));
-    ports = (char**) malloc(sizeof(char *));
-    servers[0] = DEFAULT_SERVER;
-    ports[0] = DEFAULT_PORT;
   }
+  if (curArg != argc-1)
+    printUsageAndDie();
+  filename = argv[curArg];
   LOG("input file = %s\n", filename);
 
-  // go round robin over list of servers
-  int server_to_use = 0;
+  /* Local mode? */
+  uint8_t mode = DEFAULT_MODE;
+  if (strcmp(server, "localhost") == 0) {
+    LOG("Running in LOCAL MODE.\n");
+    mode = LOCAL_MODE;
+  }
 
   /* Preamble instrumentation */
   char* shmname = getenv(SHM_ENV_VAR);
-  int status;
+  int status = 0;
+  uint8_t kelinci_status = STATUS_SUCCESS;
   if (shmname) {
 
     /* Running in AFL */
@@ -215,11 +206,6 @@ int main(int argc, char** argv) {
 
       LOGIFVERBOSE("Status %d \n", status);
       write(199, &status, 4);
-
-      // round robin use of servers
-      server_to_use++;
-      if (server_to_use >= num_servers)
-	      server_to_use = 0;
     }
 
     resume:
@@ -236,7 +222,6 @@ int main(int argc, char** argv) {
   }
 
   /* Done with initialization, now let's start the wrapper! */
-  /* send contents of file over TCP */
   int try = 0;
   size_t nread;
   char buf[FILE_READ_CHUNK];
@@ -249,50 +234,80 @@ int main(int argc, char** argv) {
     if(try > 0)
       usleep(100000);
 
-    setup_tcp_connection(servers[server_to_use], ports[server_to_use]);
-    file = fopen(filename, "r");
-    if (file) {
-      // get file size and send
-      fseek(file, 0L, SEEK_END);
-      int filesize = ftell(file);
-      rewind(file);
-      LOG("Sending file size %d\n", filesize);
-      if (write(tcp_socket, &filesize, 4) != 4) {
-	DIE("Error sending filesize");
-      }
+    setup_tcp_connection(server, port);
 
-      // send file contents
-      size_t total_sent = 0;
-      while ((nread = fread(buf, 1, sizeof buf, file)) > 0) {
-        //fwrite(buf, 1, nread, stdout);
-        if (ferror(file)) {
-          DIE("Error reading from file\n");
-        }
-        ssize_t sent = write(tcp_socket, buf, nread);
-	total_sent += sent;
-        LOG("Sent %lu bytes of %lu\n", total_sent, filesize);
+    /* Send mode */
+    write(tcp_socket, &mode, 1);
+
+    /* LOCAL MODE */
+    if (mode == LOCAL_MODE) {
+
+      // get absolute path
+      char path[10000];
+      realpath(filename, path);
+
+      // send path length
+      int pathlen = strlen(path);
+      if (write(tcp_socket, &pathlen, 4) != 4) {
+        DIE("Error sending path length");
       }
-      fclose(file);
+      LOG("Sent path length: %d\n", pathlen);
+
+      // send path
+      if (write(tcp_socket, path, pathlen) != pathlen) {
+        DIE("Error sending path");
+      }
+      LOG("Sent path: %s\n", path);
+
+    
+    /* DEFAULT MODE */
     } else {
-      DIE("Error reading file %s\n", filename);
+
+      /* Send file contents */
+      file = fopen(filename, "r");
+      if (file) {
+
+        // get file size and send
+        fseek(file, 0L, SEEK_END);
+        int filesize = ftell(file);
+        rewind(file);
+        LOG("Sending file size %d\n", filesize);
+        if (write(tcp_socket, &filesize, 4) != 4) {
+          DIE("Error sending filesize");
+        }
+
+        // send file bytes
+        size_t total_sent = 0;
+        while ((nread = fread(buf, 1, sizeof buf, file)) > 0) {
+          if (ferror(file)) {
+            DIE("Error reading from file\n");
+          }
+          ssize_t sent = write(tcp_socket, buf, nread);
+          total_sent += sent;
+          LOG("Sent %lu bytes of %lu\n", total_sent, filesize);
+        }
+        fclose(file);
+      } else {
+        DIE("Error reading file %s\n", filename);
+      }
     }
 
-    /* Read status over TCP */
-    nread = read(tcp_socket, &status, 1);
+    /* Read kelinci_status over TCP */
+    nread = read(tcp_socket, &kelinci_status, 1);
     if (nread != 1) {
       LOG("Failure reading exit status over socket.\n");
-      status = STATUS_COMM_ERROR;
+      kelinci_status = STATUS_COMM_ERROR;
       goto cont;
     }
-    LOG("Return status = %d\n", status);
+    LOG("Return kelinci_status = %d\n", status);
   
     /* Read "shared memory" over TCP */
-    uint8_t shared_mem[SHM_SIZE];
+    uint8_t *shared_mem = malloc(SHM_SIZE);
     for (int offset = 0; offset < SHM_SIZE; offset += SOCKET_READ_CHUNK) {
       nread = read(tcp_socket, shared_mem+offset, SOCKET_READ_CHUNK);
       if (nread != SOCKET_READ_CHUNK) {
 	LOG("Error reading from socket\n");
-	status = STATUS_COMM_ERROR;
+	kelinci_status = STATUS_COMM_ERROR;
 	goto cont;
       }
     }
@@ -314,7 +329,7 @@ cont: close(tcp_socket);
       DIE("Stopped trying to communicate with server.\n");
     }
 
-  } while (status == STATUS_QUEUE_FULL || status == STATUS_COMM_ERROR);
+  } while (kelinci_status == STATUS_QUEUE_FULL || kelinci_status == STATUS_COMM_ERROR);
     
   LOG("Received results. Terminating.\n\n");
 
@@ -324,7 +339,7 @@ cont: close(tcp_socket);
   }
 
   /* Terminate with CRASH signal if Java program terminated abnormally */
-  if (status == STATUS_CRASH) {
+  if (kelinci_status == STATUS_CRASH) {
     LOG("Crashing...\n");
     abort();
   }
@@ -333,10 +348,8 @@ cont: close(tcp_socket);
    * If JAVA side timed out, keep looping here till AFL hits its time-out.
    * In a good set-up, the time-out on the JAVA process is slightly longer
    * than AFLs time-out to prevent hitting this.
-   *
-   * TODO: test this
    **/
-  if (status == STATUS_TIMEOUT) {
+  if (kelinci_status == STATUS_TIMEOUT) {
     LOG("Starting infinite loop...\n");
     while (1) {
       sleep(10);

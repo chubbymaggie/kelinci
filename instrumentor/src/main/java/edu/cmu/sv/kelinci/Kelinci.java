@@ -24,9 +24,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * TODO add "local" mode that prevents sending input files
- * TODO Option to replace System.exit() with RuntimeException?
- * TODO put in the cloud
  * 
  * @author rodykers
  *
@@ -43,14 +40,17 @@ class Kelinci {
 	public static final byte STATUS_COMM_ERROR = 4;
 	public static final byte STATUS_DONE = 5;
 
-	public static final int DEFAULT_TIMEOUT = 300000; // in milliseconds
-	private static int timeout;
+	public static final long DEFAULT_TIMEOUT = 300000L; // in milliseconds
+	private static long timeout;
 	
 	public static final int DEFAULT_VERBOSITY = 2;
 	private static int verbosity;
 	
 	public static final int DEFAULT_PORT = 7007;
 	private static int port;
+	
+	public static final byte DEFAULT_MODE = 0;
+	public static final byte LOCAL_MODE = 1;
 
 	private static Method targetMain;
 	private static String targetArgs[];
@@ -108,35 +108,44 @@ class Kelinci {
 			System.exit(1);
 		}
 	}
-
+	
 	/**
-	 * Writes the provided input to a file, then calls main()
-	 * Replaces @@ by the tmp file name.
-	 * 
-	 * @param input
+	 * Calls main() with the provided file name,replaces @@ by the file name.
 	 */
-	private static long runApplication(byte input[]) {
-		Mem.clear();
+	private static long runApplication(String filename) {
 		long runtime = -1L;
-		try (FileOutputStream stream = new FileOutputStream(tmpfile)) {			
-			stream.write(input);
-			stream.close();
-			String[] args = Arrays.copyOf(targetArgs, targetArgs.length);
-			for (int i = 0; i < args.length; i++) {
-				if (args[i].equals("@@")) {
-					args[i] = tmpfile.getAbsolutePath();
-				}
+
+		String[] args = Arrays.copyOf(targetArgs, targetArgs.length);
+		for (int i = 0; i < args.length; i++) {
+			if (args[i].equals("@@")) {
+				args[i] = filename;
 			}
-			long pre = System.nanoTime();
+		}
+		long pre = System.nanoTime();
+		try {
 			targetMain.invoke(null, (Object) args);
-			runtime = System.nanoTime() - pre;
-		} catch (IOException ioe) {
-			throw new RuntimeException("Error writing to tmp file");
 		} catch (IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {
 			e.printStackTrace();
 			throw new RuntimeException("Error invoking target main method");
 		}
+		runtime = System.nanoTime() - pre;
 		return runtime;
+	}
+
+	/**
+	 * Writes the provided input to a file, then calls main().
+	 * Replaces @@ by the tmp file name.
+	 * 
+	 * @param input The file contents as a byte array.
+	 */
+	private static long runApplication(byte input[]) {
+		try (FileOutputStream stream = new FileOutputStream(tmpfile)) {			
+			stream.write(input);
+			stream.close();
+			return runApplication(tmpfile.getAbsolutePath());
+		} catch (IOException ioe) {
+			throw new RuntimeException("Error writing to tmp file");
+		}
 	}
 
 	/**
@@ -145,19 +154,29 @@ class Kelinci {
 	 */
 	private static class ApplicationCall implements Callable<Long> {
 		byte input[];
+		String path;
 
 		ApplicationCall(byte input[]) {
 			this.input = input;
 		}
+		
+		ApplicationCall(String path) {
+			this.path = path;
+		}
 
 		@Override
 		public Long call() throws Exception {
+			if (path != null)
+				return runApplication(path);
 			return runApplication(input);
 		}
 	}
 
 	/**
 	 * Method to run in a thread handling one request from the queue at a time.
+	 * 
+	 * LOCAL_MODE means you only send over a path to the input file.
+	 * DEFAULT_MODE means the actual bytes of the file are sent.
 	 */
 	private static void doFuzzerRuns() {
 		if (verbosity > 1) 
@@ -173,37 +192,90 @@ class Kelinci {
 					InputStream is = request.clientSocket.getInputStream();
 					OutputStream os = request.clientSocket.getOutputStream();
 
+					Mem.clear();
 					byte result = STATUS_CRASH;
+					ApplicationCall appCall = null;
 
-					// read the size of the input file (integer)
-					int filesize = is.read() | is.read() << 8 | is.read() << 16 | is.read() << 24;
-					if (verbosity > 2)
-						System.out.println("File size = " + filesize);
-
-					if (filesize < 0) {
-						if (verbosity > 1)
-							System.err.println("Failed to read file size");
-						result = STATUS_COMM_ERROR;
-					} else {
-
-						// read the input file
-						byte input[] = new byte[filesize];
-						int read = 0;
-						while (read < filesize) {			
-							if (is.available() > 0) {
-								input[read++] = (byte) is.read();
-							} else {
-								if (verbosity > 1) {
-									System.err.println("No input available from stream, strangely");
-									System.err.println("Appending a 0");
+					// read the mode (local or default)
+					byte mode = (byte) is.read();
+					
+					/* LOCAL MODE */
+					if (mode == LOCAL_MODE) {
+						if (verbosity > 1) 
+							System.out.println("Handling request in LOCAL MODE.");
+						
+						// read the length of the path (integer)
+						int pathlen = is.read() | is.read() << 8 | is.read() << 16 | is.read() << 24;
+						if (verbosity > 2)
+							System.out.println("Path len = " + pathlen);
+						
+						if (pathlen < 0) {
+							if (verbosity > 1)
+								System.err.println("Failed to read path length");
+							result = STATUS_COMM_ERROR;
+						} else {
+						
+							// read the path
+							byte input[] = new byte[pathlen];
+							int read = 0;
+							while (read < pathlen) {			
+								if (is.available() > 0) {
+									input[read++] = (byte) is.read();
+								} else {
+									if (verbosity > 1) {
+										System.err.println("No input available from stream, strangely, breaking.");
+										result = STATUS_COMM_ERROR;
+										break;
+									}
 								}
-								input[read++] = 0;
 							}
+							String path = new String(input);
+							if (verbosity > 1)
+								System.out.println("Received path: " + path);
+							
+							appCall = new ApplicationCall(path);
 						}
+						
+					/* DEFAULT MODE */
+					} else {
+						if (verbosity > 1) 
+							System.out.println("Handling request in DEFAULT MODE.");
+						
+						// read the size of the input file (integer)
+						int filesize = is.read() | is.read() << 8 | is.read() << 16 | is.read() << 24;
+						if (verbosity > 2)
+							System.out.println("File size = " + filesize);
+
+						if (filesize < 0) {
+							if (verbosity > 1)
+								System.err.println("Failed to read file size");
+							result = STATUS_COMM_ERROR;
+						} else {
+
+							// read the input file
+							byte input[] = new byte[filesize];
+							int read = 0;
+							while (read < filesize) {			
+								if (is.available() > 0) {
+									input[read++] = (byte) is.read();
+								} else {
+									if (verbosity > 1) {
+										System.err.println("No input available from stream, strangely");
+										System.err.println("Appending a 0");
+									}
+									input[read++] = 0;
+								}
+							}
+							
+							appCall = new ApplicationCall(input);
+						}
+					}
+					
+					if (result != STATUS_COMM_ERROR && appCall != null) {
 
 						// run app with input
 						ExecutorService executor = Executors.newSingleThreadExecutor();
-						Future<Long> future = executor.submit(new ApplicationCall(input));
+						Future<Long> future = executor.submit(appCall);
 
 						try {
 							if (verbosity > 1)
@@ -294,7 +366,7 @@ class Kelinci {
 				verbosity = Integer.parseInt(args[curArg+1]);
 				curArg += 2;
 			} else if (args[curArg].equals("-t") || args[curArg].equals("-timeout")) {
-				timeout = Integer.parseInt(args[curArg+1]);
+				timeout = Long.parseLong(args[curArg+1]);
 				curArg += 2;
 			} else {
 				break;
@@ -364,9 +436,7 @@ class Kelinci {
 		server.start();
 
 		/**
-		 * Handle requests for fuzzer runs in multiple threads.
-		 * The number of threads can be specified by the user with the -threads option.
-		 * By default, the number of threads is equal to the number of available processors - 1.
+		 * Handle requests for fuzzer runs in separate thread.
 		 */
 		Thread fuzzerRuns = new Thread(new Runnable() {
 			@Override
